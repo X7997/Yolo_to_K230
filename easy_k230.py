@@ -4,8 +4,13 @@
 Yolo_to_K230 - 一键将 YOLO 模型转换为 K230 Kmodel
 
 用法:
-    python easy_k230.py                    # 交互式引导
-    python easy_k230.py --model best.pt    # 指定模型路径
+    python easy_k230.py                    # 交互式引导（每次询问模型路径）
+    python easy_k230.py --model=best.pt    # 命令行指定模型（跳过交互）
+    python easy_k230.py --model=best.pt --calib=images/  # 完整命令行
+
+提示:
+    - 交互模式下直接回车可使用上次保存的配置
+    - 配置自动保存到 config.json
 """
 
 import os
@@ -37,6 +42,7 @@ DEFAULT_CONFIG = {
     "target": "k230",
     "kmodel_filename": "",
     "proxy_port": 0,
+    "_configured": False,
 }
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -98,54 +104,79 @@ def save_config(cfg):
     PROGRESS.info(f"配置已保存到 {CONFIG_PATH}")
 
 
-def interactive_setup(cfg):
+def interactive_setup(cfg, force_all=False):
+    """交互式配置，每次询问模型路径，回车使用上次配置"""
     print("\n" + "=" * 60)
-    print("  Yolo_to_K230 首次配置向导")
+    print("  Yolo_to_K230 配置")
     print("=" * 60)
-    print("  请按提示填写，之后会自动保存，无需再次输入\n")
+    print("  提示: 直接回车使用上次保存的配置\n")
 
-    if not cfg.get("github_repo_url"):
-        print("📋 步骤 1/4: GitHub 仓库")
-        print("   请在 GitHub 上创建一个空仓库（不要勾选 README/gitignore/license）")
-        print("   示例: https://github.com/你的用户名/Yolo_to_K230.git")
-        cfg["github_repo_url"] = input("   粘贴仓库地址: ").strip().strip("'\"")
+    # 模型路径 - 每次都询问
+    print("📋 模型文件路径（.pt 或 .onnx）")
+    if cfg.get("source_pt"):
+        print(f"   上次: {cfg['source_pt']}")
+    new_path = input("   新路径 [回车保持]: ").strip().strip("'\"")
+    if new_path:
+        cfg["source_pt"] = new_path
 
     if not cfg.get("source_pt"):
-        print("\n📋 步骤 2/4: 模型文件")
-        print("   请提供训练好的 YOLO 模型路径（.pt 或 .onnx）")
-        print("   示例: C:\\Users\\xxx\\runs\\detect\\train\\weights\\best.pt")
-        cfg["source_pt"] = input("   粘贴模型路径: ").strip().strip("'\"")
+        print("   ❌ 模型路径不能为空")
+        sys.exit(1)
+
+    # 校准图目录 - 每次都询问
+    print("\n📋 校准图目录")
+    if cfg.get("source_calib"):
+        print(f"   上次: {cfg['source_calib']}")
+    new_calib = input("   新目录 [回车保持]: ").strip().strip("'\"")
+    if new_calib:
+        cfg["source_calib"] = new_calib
 
     if not cfg.get("source_calib"):
-        print("\n📋 步骤 3/4: 校准图目录")
-        print("   请提供用于 PTQ 量化的校准图片目录（通常用验证集图片即可）")
-        print("   示例: C:\\Users\\xxx\\datasets\\fridge\\valid\\images")
-        cfg["source_calib"] = input("   粘贴校准图目录: ").strip().strip("'\"")
+        print("   ❌ 校准图目录不能为空")
+        sys.exit(1)
 
-    print("\n📋 步骤 4/4: 转换参数（直接回车使用默认值）")
-    print(f"   输入尺寸 [N,C,H,W]（默认 {cfg['input_shape']}）: ", end="")
-    shape_str = input().strip()
-    if shape_str:
-        try:
-            cfg["input_shape"] = [int(x.strip()) for x in shape_str.replace("[", "").replace("]", "").split(",")]
-        except ValueError:
-            print("   ⚠️ 格式不对，使用默认值")
+    # 首次配置或强制配置时，询问仓库地址和高级参数
+    if force_all or not cfg.get("github_repo_url"):
+        print("\n📋 GitHub 仓库地址")
+        print("   示例: https://github.com/用户名/仓库名.git")
+        if cfg.get("github_repo_url"):
+            print(f"   上次: {cfg['github_repo_url']}")
+        new_repo = input("   新地址 [回车保持]: ").strip().strip("'\"")
+        if new_repo:
+            cfg["github_repo_url"] = new_repo
 
-    print(f"   ONNX imgsz（默认 {cfg['onnx_imgsz']}）: ", end="")
-    imgsz_str = input().strip()
-    if imgsz_str:
-        cfg["onnx_imgsz"] = int(imgsz_str)
+    if not cfg.get("github_repo_url"):
+        print("   ❌ 仓库地址不能为空")
+        sys.exit(1)
 
-    if not cfg.get("kmodel_filename"):
-        model_name = Path(cfg["source_pt"]).stem if cfg.get("source_pt") else "model"
-        cfg["kmodel_filename"] = f"{model_name}.kmodel"
-    print(f"   输出文件名（默认 {cfg['kmodel_filename']}）: ", end="")
-    kfn = input().strip()
-    if kfn:
-        cfg["kmodel_filename"] = kfn if kfn.endswith(".kmodel") else kfn + ".kmodel"
+    # 高级参数 - 仅首次或明确要求时询问
+    if force_all or not cfg.get("_configured"):
+        print("\n📋 高级参数（直接回车使用默认值）")
+        print(f"   输入尺寸 [N,C,H,W]（默认 {cfg['input_shape']}）: ", end="")
+        shape_str = input().strip()
+        if shape_str:
+            try:
+                cfg["input_shape"] = [int(x.strip()) for x in shape_str.replace("[", "").replace("]", "").split(",")]
+            except ValueError:
+                print("   ⚠️ 格式不对，使用默认值")
 
-    proxy = input("   本地代理端口（v2rayN=10808, Clash=7890, 无代理=0, 默认0）: ").strip()
-    cfg["proxy_port"] = int(proxy) if proxy else 0
+        print(f"   ONNX imgsz（默认 {cfg['onnx_imgsz']}）: ", end="")
+        imgsz_str = input().strip()
+        if imgsz_str:
+            cfg["onnx_imgsz"] = int(imgsz_str)
+
+        if not cfg.get("kmodel_filename"):
+            model_name = Path(cfg["source_pt"]).stem
+            cfg["kmodel_filename"] = f"{model_name}.kmodel"
+        print(f"   输出文件名（默认 {cfg['kmodel_filename']}）: ", end="")
+        kfn = input().strip()
+        if kfn:
+            cfg["kmodel_filename"] = kfn if kfn.endswith(".kmodel") else kfn + ".kmodel"
+
+        proxy = input("   本地代理端口（v2rayN=10808, Clash=7890, 无=0, 默认0）: ").strip()
+        cfg["proxy_port"] = int(proxy) if proxy else 0
+
+        cfg["_configured"] = True
 
     save_config(cfg)
     return cfg
@@ -477,10 +508,9 @@ def main():
                 cfg["github_repo_url"] = arg.split("=", 1)[1].strip("'\"")
         save_config(cfg)
     else:
+        # 每次运行都进入交互式配置
         cfg = load_config()
-        needs_setup = not cfg.get("source_pt") or not cfg.get("source_calib") or not cfg.get("github_repo_url")
-        if needs_setup:
-            cfg = interactive_setup(cfg)
+        cfg = interactive_setup(cfg, force_all=not cfg.get("_configured"))
 
     print()
     print(f"  模型:   {cfg['source_pt']}")
