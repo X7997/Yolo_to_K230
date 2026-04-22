@@ -15,6 +15,7 @@ import subprocess
 import time
 import json
 from pathlib import Path
+from datetime import datetime
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║                     ★ 配置区（交互式填入后自动保存） ★                ║
@@ -45,6 +46,39 @@ MODELS_DIR = REPO_ROOT / "models"
 CALIB_DIR = REPO_ROOT / "calib"
 OUTPUT_DIR = REPO_ROOT / "output"
 
+STEPS = [
+    "① 环境检查",
+    "② 文件准备",
+    "③ 参数同步",
+    "④ 推送上传",
+    "⑤ 云端转换",
+    "⑥ 下载结果",
+]
+
+
+# ─── 进度条 ────────────────────────────────────────────────────────────
+
+class ProgressBar:
+    def __init__(self, total_steps=6):
+        self.total = total_steps
+        self.current = 0
+        self.step_names = STEPS[:total_steps]
+
+    def advance(self, msg=""):
+        self.current += 1
+        pct = self.current * 100 // self.total
+        filled = "█" * self.current
+        empty = "░" * (self.total - self.current)
+        step_label = self.step_names[self.current - 1] if self.current <= len(self.step_names) else ""
+        suffix = f" {msg}" if msg else ""
+        print(f"\r  [{filled}{empty}] {pct:3d}%  {step_label}{suffix}")
+
+    def info(self, msg):
+        print(f"       {msg}")
+
+
+PROGRESS = ProgressBar(6)
+
 
 # ─── 配置加载/保存 ────────────────────────────────────────────────────
 
@@ -61,7 +95,7 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
-    print(f"✅ 配置已保存到 {CONFIG_PATH}")
+    PROGRESS.info(f"配置已保存到 {CONFIG_PATH}")
 
 
 def interactive_setup(cfg):
@@ -119,8 +153,9 @@ def interactive_setup(cfg):
 
 # ─── 工具函数 ──────────────────────────────────────────────────────────
 
-def run_cmd(cmd, check=True, capture=True, cwd=None):
-    print(f">>> {cmd}")
+def run_cmd(cmd, check=True, capture=True, cwd=None, quiet=False):
+    if not quiet:
+        print(f"  >>> {cmd}")
     kwargs = {"shell": True, "encoding": "utf-8", "errors": "replace"}
     if cwd:
         kwargs["cwd"] = str(cwd)
@@ -129,10 +164,11 @@ def run_cmd(cmd, check=True, capture=True, cwd=None):
     if capture:
         kwargs["capture_output"] = True
     result = subprocess.run(cmd, **kwargs)
-    if result.stdout:
-        print(result.stdout)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
+    if not quiet:
+        if result.stdout and len(result.stdout) < 500:
+            print(result.stdout)
+        if result.stderr and len(result.stderr) < 500:
+            print(result.stderr, file=sys.stderr)
     if check and result.returncode != 0:
         raise RuntimeError(f"命令失败: {cmd}")
     return result
@@ -145,39 +181,52 @@ def setup_proxy(proxy_port):
     os.environ["HTTP_PROXY"] = proxy_url
     os.environ["HTTPS_PROXY"] = proxy_url
     os.environ["ALL_PROXY"] = proxy_url
-    run_cmd(f'git config --global http.proxy "{proxy_url}"', check=False)
-    run_cmd(f'git config --global https.proxy "{proxy_url}"', check=False)
-    print(f"✅ 代理已设置: {proxy_url}")
+    run_cmd(f'git config --global http.proxy "{proxy_url}"', check=False, quiet=True)
+    run_cmd(f'git config --global https.proxy "{proxy_url}"', check=False, quiet=True)
+    print(f"  ✅ 代理已设置: {proxy_url}")
+
+
+def format_duration(seconds):
+    if seconds < 60:
+        return f"{seconds:.0f}秒"
+    return f"{seconds // 60}分{seconds % 60:02d}秒"
+
+
+def format_size(path):
+    size = Path(path).stat().st_size
+    if size > 1024 * 1024:
+        return f"{size / 1024 / 1024:.1f} MB"
+    return f"{size / 1024:.0f} KB"
 
 
 # ─── 主要流程 ──────────────────────────────────────────────────────────
 
 def check_gh_login():
-    res = run_cmd("gh auth status", check=False)
+    res = run_cmd("gh auth status", check=False, quiet=True)
     if res.returncode != 0:
-        print("\n❌ GitHub CLI (gh) 未登录")
-        print("   请先在终端运行: gh auth login")
-        print("   选择 HTTPS → 浏览器授权即可\n")
+        print("\n  ❌ GitHub CLI (gh) 未登录")
+        print("  请先在终端运行: gh auth login")
+        print("  选择 HTTPS → 浏览器授权即可\n")
         sys.exit(1)
-    print("✅ GitHub CLI 已登录")
+    print("  ✅ GitHub CLI 已登录")
 
 
 def init_git(repo_url):
     git_dir = REPO_ROOT / ".git"
     if not git_dir.exists():
-        run_cmd("git init")
-        print("✅ 已初始化本地 git 仓库")
+        run_cmd("git init", quiet=True)
+        print("  ✅ 已初始化本地 git 仓库")
 
-    res = run_cmd("git remote get-url origin", check=False)
+    res = run_cmd("git remote get-url origin", check=False, quiet=True)
     current_url = res.stdout.strip() if res.returncode == 0 else ""
     if not current_url:
-        run_cmd(f"git remote add origin {repo_url}")
-        print(f"✅ 已关联远程仓库: {repo_url}")
+        run_cmd(f"git remote add origin {repo_url}", quiet=True)
+        print(f"  ✅ 已关联远程仓库: {repo_url}")
     elif current_url != repo_url:
-        run_cmd(f"git remote set-url origin {repo_url}")
-        print(f"✅ 远程仓库已更新: {current_url} -> {repo_url}")
+        run_cmd(f"git remote set-url origin {repo_url}", quiet=True)
+        print(f"  ✅ 远程仓库已更新: {repo_url}")
     else:
-        print(f"✅ 远程仓库已关联: {repo_url}")
+        print(f"  ✅ 远程仓库已关联: {repo_url}")
 
 
 def prepare_files(cfg):
@@ -189,35 +238,41 @@ def prepare_files(cfg):
     source_calib = cfg["source_calib"]
 
     if not os.path.isfile(source_pt):
-        print(f"❌ 找不到模型文件: {source_pt}")
+        print(f"  ❌ 找不到模型文件: {source_pt}")
         sys.exit(1)
     dest_pt = MODELS_DIR / "input.pt"
     shutil.copy2(source_pt, dest_pt)
-    print(f"✅ 已复制模型 -> {dest_pt}  ({dest_pt.stat().st_size / 1024 / 1024:.1f} MB)")
+    print(f"  ✅ 模型  {os.path.basename(source_pt)}  ({format_size(dest_pt)})")
 
     if not os.path.isdir(source_calib):
-        print(f"❌ 找不到校准图目录: {source_calib}")
+        print(f"  ❌ 找不到校准图目录: {source_calib}")
         sys.exit(1)
 
     images = [p for p in Path(source_calib).iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp")]
     if not images:
-        print("❌ 校准图目录里没有支持的图片格式")
+        print("  ❌ 校准图目录里没有支持的图片格式")
         sys.exit(1)
 
     for old in CALIB_DIR.iterdir():
         old.unlink()
 
-    for img in images:
+    total = len(images)
+    bar_width = 30
+    for i, img in enumerate(images, 1):
         shutil.copy2(img, CALIB_DIR / img.name)
+        pct = i * 100 // total
+        filled = "█" * (pct * bar_width // 100)
+        empty = "░" * (bar_width - len(filled))
+        print(f"\r  复制校准图 [{filled}{empty}] {i}/{total} ({pct}%)", end="", flush=True)
+    print(f"\r  ✅ 校准图  {total} 张全部复制完成                    ")
 
-    print(f"✅ 已复制全部 {len(images)} 张校准图 -> {CALIB_DIR}")
-    return len(images)
+    return total
 
 
 def sync_workflow_env(cfg, calib_count):
     yml_path = REPO_ROOT / ".github" / "workflows" / "convert_k230.yml"
     if not yml_path.exists():
-        print("⚠️ 未找到 workflow yml，跳过同步")
+        print("  ⚠️ 未找到 workflow yml，跳过同步")
         return
 
     with open(yml_path, "r", encoding="utf-8") as f:
@@ -247,111 +302,169 @@ def sync_workflow_env(cfg, calib_count):
     if new_content != content:
         with open(yml_path, "w", encoding="utf-8") as f:
             f.write(new_content)
-        print(f"✅ 已同步参数到 workflow yml ({ishape}, 校准图={calib_count}张)")
+        print(f"  ✅ 参数已同步 INPUT_SHAPE={ishape}, {calib_count}张校准图")
+    else:
+        print("  ℹ️ workflow 参数无变化")
 
 
 def push_to_github(cfg):
     sync_workflow_env(cfg, getattr(sys.modules[__name__], '_calib_count', 999))
 
-    run_cmd("git checkout -B convert-request")
+    run_cmd("git checkout -B convert-request", quiet=True)
 
-    # 只追踪转换必需的文件
-    run_cmd(f'git add -f "{MODELS_DIR}/" "{CALIB_DIR}/"')
-    run_cmd(f'git add -f "{REPO_ROOT / ".github" / "workflows" / "convert_k230.yml"}"')
-    run_cmd(f'git add -f "{REPO_ROOT / "convert_k230.py"}"')
-    run_cmd(f'git add -f "{REPO_ROOT / "easy_k230.py"}"')
-    run_cmd(f'git add -f "{REPO_ROOT / "README.md"}"')
+    run_cmd(f'git add -f "{MODELS_DIR}/" "{CALIB_DIR}/"', quiet=True)
+    run_cmd(f'git add -f "{REPO_ROOT / ".github" / "workflows" / "convert_k230.yml"}"', quiet=True)
+    run_cmd(f'git add -f "{REPO_ROOT / "convert_k230.py"}"', quiet=True)
+    run_cmd(f'git add -f "{REPO_ROOT / "easy_k230.py"}"', quiet=True)
+    run_cmd(f'git add -f "{REPO_ROOT / "README.md"}"', quiet=True)
 
-    # 确保 .gitignore 追踪
     gitignore_path = REPO_ROOT / ".gitignore"
     if gitignore_path.exists():
-        run_cmd(f'git add -f "{gitignore_path}"')
+        run_cmd(f'git add -f "{gitignore_path}"', quiet=True)
 
-    # 排除无关的 ultralytics workflow 文件
     for wf in ["ci.yml", "cla.yml", "conda-check-prs.yml", "docker.yml", "docs.yml",
                "format.yml", "links.yml", "merge-main-into-prs.yml", "mirror.yml",
                "publish.yml", "stale.yml"]:
-        run_cmd(f'git reset HEAD -- ".github/workflows/{wf}"', check=False)
-    run_cmd("git reset HEAD -- .github/ISSUE_TEMPLATE/ .github/dependabot.yml", check=False)
+        run_cmd(f'git reset HEAD -- ".github/workflows/{wf}"', check=False, quiet=True)
+    run_cmd("git reset HEAD -- .github/ISSUE_TEMPLATE/ .github/dependabot.yml", check=False, quiet=True)
 
-    run_cmd("git status", check=False)
-    res = run_cmd('git commit -m "Request K230 conversion"', check=False)
+    res = run_cmd('git commit -m "Request K230 conversion"', check=False, quiet=True)
     if res.returncode != 0:
-        print("⚠️ 没有新的变更需要提交，仍将推送以触发 Actions")
-    run_cmd("git push -u origin convert-request --force")
-    print("✅ 已推送到 GitHub（convert-request 分支）")
+        print("  ⚠️ 无新变更，仍将推送触发 Actions")
+    run_cmd("git push -u origin convert-request --force", quiet=True)
+    print("  ✅ 已推送到 GitHub")
+
+
+def poll_run_status(run_id):
+    """轮询 Actions 运行状态，显示进度条和当前步骤"""
+    start = time.time()
+    step_emojis = {"Setup": "⚙️", "Install": "📦", "Run conversion": "🔥", "Upload": "⬆️", "Post": "✅"}
+
+    while True:
+        res = run_cmd(
+            f'gh run view {run_id} --json status,conclusion,jobs --jq '
+            '"{status: .status, conclusion: .conclusion, '
+            'steps: [.jobs[0].steps[] | {name: .name, status: .status, conclusion: .conclusion}]}"',
+            check=False, quiet=True
+        )
+        if res.returncode != 0:
+            time.sleep(5)
+            continue
+
+        try:
+            data = json.loads(res.stdout.strip())
+        except (json.JSONDecodeError, ValueError):
+            time.sleep(5)
+            continue
+
+        status = data.get("status", "")
+        conclusion = data.get("conclusion", "")
+        steps = data.get("steps", [])
+
+        done = sum(1 for s in steps if s.get("conclusion") == "success")
+        total = max(len(steps), 1)
+        pct = done * 100 // total
+        filled = "█" * done
+        empty = "░" * (total - done)
+
+        current_step = ""
+        for s in steps:
+            if s.get("status") == "in_progress":
+                current_step = s.get("name", "")
+                break
+
+        emoji = "⏳"
+        for key, em in step_emojis.items():
+            if key in current_step:
+                emoji = em
+                break
+
+        elapsed = format_duration(time.time() - start)
+        step_info = f" {emoji} {current_step}" if current_step else ""
+        print(f"\r  [{filled}{empty}] {pct:3d}%{step_info}  ({elapsed})", end="", flush=True)
+
+        if status == "completed":
+            print()
+            return conclusion == "success"
+
+        time.sleep(3)
 
 
 def wait_and_download(cfg):
-    print("\n⏳ 等待 GitHub Actions 启动...")
-    time.sleep(10)
+    print("\n  ⏳ 等待 GitHub Actions 启动...")
+    time.sleep(8)
 
-    res = run_cmd('gh run list --branch convert-request --limit 1 --json databaseId,status,conclusion,name', check=False)
+    PROGRESS.advance("云端转换")
+    res = run_cmd('gh run list --branch convert-request --limit 1 --json databaseId,status,conclusion,name', check=False, quiet=True)
     if res.returncode != 0 or not res.stdout.strip():
-        print("⚠️ 无法获取 Actions 运行列表")
+        print("  ⚠️ 无法获取 Actions 运行列表")
         return False
 
     try:
         runs = json.loads(res.stdout.strip())
     except json.JSONDecodeError:
-        print("⚠️ 解析 Actions 列表失败")
+        print("  ⚠️ 解析 Actions 列表失败")
         return False
 
     if not runs:
-        print("⚠️ 未找到运行记录")
+        print("  ⚠️ 未找到运行记录")
         return False
 
     run_id = runs[0]["databaseId"]
-    print(f"🔍 运行 ID: {run_id}")
-    print("⏳ 等待转换完成（通常 3~8 分钟）...\n")
+    print(f"  🔍 运行 ID: {run_id}")
 
-    watch_res = run_cmd(f"gh run watch {run_id} --exit-status", check=False, capture=False)
-    if watch_res.returncode != 0:
-        print("\n❌ GitHub Actions 运行失败")
-        log_res = run_cmd(f"gh run view {run_id} --log-failed", check=False)
+    success = poll_run_status(run_id)
+
+    if not success:
+        print("  ❌ GitHub Actions 运行失败")
+        log_res = run_cmd(f"gh run view {run_id} --log-failed", check=False, quiet=True)
         if log_res.returncode == 0 and log_res.stdout:
-            print("--- 失败日志 ---")
-            print(log_res.stdout[-3000:])
+            print("  --- 失败日志（最后 20 行）---")
+            lines = log_res.stdout.strip().split("\n")
+            for line in lines[-20:]:
+                print(f"  {line}")
         return False
 
-    print("\n✅ 转换成功！下载结果...")
-
+    # 下载
+    PROGRESS.advance("下载结果")
     for f in OUTPUT_DIR.iterdir():
         if f.is_file():
             f.unlink()
         elif f.is_dir():
             shutil.rmtree(f)
 
-    dl_res = run_cmd(f'gh run download {run_id} --name k230-model --dir "{OUTPUT_DIR}"', check=False)
+    dl_res = run_cmd(f'gh run download {run_id} --name k230-model --dir "{OUTPUT_DIR}"', check=False, quiet=True)
     if dl_res.returncode != 0:
-        dl_res = run_cmd(f'gh run download {run_id} --dir "{OUTPUT_DIR}"', check=False)
+        dl_res = run_cmd(f'gh run download {run_id} --dir "{OUTPUT_DIR}"', check=False, quiet=True)
         if dl_res.returncode != 0:
+            print("  ❌ 下载失败")
             return False
 
     kmodels = list(OUTPUT_DIR.rglob("*.kmodel"))
     if kmodels:
         script_dir = Path(__file__).parent.resolve()
-        print("\n" + "=" * 60)
-        print("🎉 转换成功！Kmodel 已下载到本地:")
         for k in kmodels:
-            size_kb = k.stat().st_size / 1024
-            print(f"   📦 {k}  ({size_kb:.1f} KB)")
             final = script_dir / k.name
             shutil.copy2(k, final)
-            print(f"   📋 {final}")
-        print("=" * 60)
+        print(f"  ✅ 已下载 {kmodels[0].name}  ({format_size(kmodels[0])})")
+        print(f"  📂 保存位置: {script_dir / kmodels[0].name}")
     else:
-        print("⚠️ 未找到 .kmodel 文件")
+        print("  ⚠️ 未找到 .kmodel 文件")
         return False
     return True
 
 
 def main():
-    print("=" * 60)
-    print("  Yolo_to_K230 - YOLO 模型一键转 K230 Kmodel")
-    print("=" * 60)
+    total_start = time.time()
 
-    # 命令行参数支持
+    print()
+    print("  ╔══════════════════════════════════════════════════╗")
+    print("  ║     🔧 Yolo_to_K230 — 一键转换 K230 Kmodel      ║")
+    print("  ║     本地零环境 · GitHub Actions 云端转换          ║")
+    print("  ╚══════════════════════════════════════════════════╝")
+    print()
+
+    # 命令行参数或交互式配置
     args = sys.argv[1:]
     if args:
         cfg = load_config()
@@ -369,29 +482,48 @@ def main():
         if needs_setup:
             cfg = interactive_setup(cfg)
 
-    print(f"\n  模型:   {cfg['source_pt']}")
+    print()
+    print(f"  模型:   {cfg['source_pt']}")
     print(f"  校准图: {cfg['source_calib']}")
     print(f"  尺寸:   {cfg['input_shape']}  (imgsz={cfg['onnx_imgsz']})")
-    print(f"  目标:   {cfg['target']}")
-    print(f"  量化:   {cfg['quant_type']}/{cfg['w_quant_type']} method={cfg['calib_method']}")
+    print(f"  目标:   {cfg['target']}  量化: {cfg['quant_type']}/{cfg['w_quant_type']}")
     print(f"  输出:   {cfg['kmodel_filename']}")
-    print(f"  仓库:   {cfg['github_repo_url']}")
     print()
-
+    print("  " + "=" * 50)
+    print("  进度:")
+    PROGRESS.advance("环境检查")
     setup_proxy(cfg.get("proxy_port", 0))
     check_gh_login()
     init_git(cfg["github_repo_url"])
+
+    PROGRESS.advance("文件准备")
     calib_count = prepare_files(cfg)
     sys.modules[__name__]._calib_count = calib_count
+
+    PROGRESS.advance("参数同步")
     push_to_github(cfg)
+
     success = wait_and_download(cfg)
 
-    if not success:
-        url = cfg.get("github_repo_url", "").rstrip(".git") + "/actions"
-        print(f"\n💡 请手动打开 GitHub Actions 页面查看:")
-        print(f"   {url}")
+    elapsed = format_duration(time.time() - total_start)
 
-    print("\n流程结束")
+    if success:
+        PROGRESS.current = PROGRESS.total
+        print(f"\n  [████████] 100%  全部完成！  ({elapsed})")
+        print()
+        script_dir = Path(__file__).parent
+        kmodel = next(script_dir.glob("*.kmodel"), None)
+        if kmodel:
+            print(f"  📦 Kmodel: {kmodel}")
+            print(f"  📏 大小:   {format_size(kmodel)}")
+            print()
+            print("  将此文件拷贝到 K230 开发板即可使用！")
+    else:
+        url = cfg.get("github_repo_url", "").rstrip(".git") + "/actions"
+        print(f"\n  ❌ 转换失败  ({elapsed})")
+        print(f"  💡 查看: {url}")
+
+    print()
 
 
 if __name__ == "__main__":
