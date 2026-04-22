@@ -1,0 +1,11 @@
+# 交付产物 / 运行时生成
+models/
+calib/
+output/
+config.json
+tmp/
+*.onnx
+*.kmodel
+*.pt
+!models/.gitkeep
+!calib/.gitkeep

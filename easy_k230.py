@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Yolo_to_K230 - 一键将 YOLO 模型转换为 K230 Kmodel
+
+用法:
+    python easy_k230.py                    # 交互式引导
+    python easy_k230.py --model best.pt    # 指定模型路径
+"""
+
+import os
+import sys
+import shutil
+import subprocess
+import time
+import json
+from pathlib import Path
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                     ★ 配置区（交互式填入后自动保存） ★                ║
+# ║  首次运行会交互式引导填写，之后自动保存到 config.json 无需再改       ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+DEFAULT_CONFIG = {
+    "github_repo_url": "",
+    "source_pt": "",
+    "source_calib": "",
+    "input_shape": [1, 3, 320, 320],
+    "onnx_imgsz": 320,
+    "onnx_opset": 11,
+    "onnx_simplify": True,
+    "onnx_nms": False,
+    "quant_type": "uint8",
+    "w_quant_type": "uint8",
+    "calib_method": "Kld",
+    "target": "k230",
+    "kmodel_filename": "",
+    "proxy_port": 0,
+}
+
+CONFIG_PATH = Path(__file__).parent / "config.json"
+
+REPO_ROOT = Path(__file__).parent.resolve()
+MODELS_DIR = REPO_ROOT / "models"
+CALIB_DIR = REPO_ROOT / "calib"
+OUTPUT_DIR = REPO_ROOT / "output"
+
+
+# ─── 配置加载/保存 ────────────────────────────────────────────────────
+
+def load_config():
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update(saved)
+        return cfg
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    print(f"✅ 配置已保存到 {CONFIG_PATH}")
+
+
+def interactive_setup(cfg):
+    print("\n" + "=" * 60)
+    print("  Yolo_to_K230 首次配置向导")
+    print("=" * 60)
+    print("  请按提示填写，之后会自动保存，无需再次输入\n")
+
+    if not cfg.get("github_repo_url"):
+        print("📋 步骤 1/4: GitHub 仓库")
+        print("   请在 GitHub 上创建一个空仓库（不要勾选 README/gitignore/license）")
+        print("   示例: https://github.com/你的用户名/Yolo_to_K230.git")
+        cfg["github_repo_url"] = input("   粘贴仓库地址: ").strip().strip("'\"")
+
+    if not cfg.get("source_pt"):
+        print("\n📋 步骤 2/4: 模型文件")
+        print("   请提供训练好的 YOLO 模型路径（.pt 或 .onnx）")
+        print("   示例: C:\\Users\\xxx\\runs\\detect\\train\\weights\\best.pt")
+        cfg["source_pt"] = input("   粘贴模型路径: ").strip().strip("'\"")
+
+    if not cfg.get("source_calib"):
+        print("\n📋 步骤 3/4: 校准图目录")
+        print("   请提供用于 PTQ 量化的校准图片目录（通常用验证集图片即可）")
+        print("   示例: C:\\Users\\xxx\\datasets\\fridge\\valid\\images")
+        cfg["source_calib"] = input("   粘贴校准图目录: ").strip().strip("'\"")
+
+    print("\n📋 步骤 4/4: 转换参数（直接回车使用默认值）")
+    print(f"   输入尺寸 [N,C,H,W]（默认 {cfg['input_shape']}）: ", end="")
+    shape_str = input().strip()
+    if shape_str:
+        try:
+            cfg["input_shape"] = [int(x.strip()) for x in shape_str.replace("[", "").replace("]", "").split(",")]
+        except ValueError:
+            print("   ⚠️ 格式不对，使用默认值")
+
+    print(f"   ONNX imgsz（默认 {cfg['onnx_imgsz']}）: ", end="")
+    imgsz_str = input().strip()
+    if imgsz_str:
+        cfg["onnx_imgsz"] = int(imgsz_str)
+
+    if not cfg.get("kmodel_filename"):
+        model_name = Path(cfg["source_pt"]).stem if cfg.get("source_pt") else "model"
+        cfg["kmodel_filename"] = f"{model_name}.kmodel"
+    print(f"   输出文件名（默认 {cfg['kmodel_filename']}）: ", end="")
+    kfn = input().strip()
+    if kfn:
+        cfg["kmodel_filename"] = kfn if kfn.endswith(".kmodel") else kfn + ".kmodel"
+
+    proxy = input("   本地代理端口（v2rayN=10808, Clash=7890, 无代理=0, 默认0）: ").strip()
+    cfg["proxy_port"] = int(proxy) if proxy else 0
+
+    save_config(cfg)
+    return cfg
+
+
+# ─── 工具函数 ──────────────────────────────────────────────────────────
+
+def run_cmd(cmd, check=True, capture=True, cwd=None):
+    print(f">>> {cmd}")
+    kwargs = {"shell": True, "encoding": "utf-8", "errors": "replace"}
+    if cwd:
+        kwargs["cwd"] = str(cwd)
+    else:
+        kwargs["cwd"] = str(REPO_ROOT)
+    if capture:
+        kwargs["capture_output"] = True
+    result = subprocess.run(cmd, **kwargs)
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print(result.stderr, file=sys.stderr)
+    if check and result.returncode != 0:
+        raise RuntimeError(f"命令失败: {cmd}")
+    return result
+
+
+def setup_proxy(proxy_port):
+    if not proxy_port:
+        return
+    proxy_url = f"http://127.0.0.1:{proxy_port}"
+    os.environ["HTTP_PROXY"] = proxy_url
+    os.environ["HTTPS_PROXY"] = proxy_url
+    os.environ["ALL_PROXY"] = proxy_url
+    run_cmd(f'git config --global http.proxy "{proxy_url}"', check=False)
+    run_cmd(f'git config --global https.proxy "{proxy_url}"', check=False)
+    print(f"✅ 代理已设置: {proxy_url}")
+
+
+# ─── 主要流程 ──────────────────────────────────────────────────────────
+
+def check_gh_login():
+    res = run_cmd("gh auth status", check=False)
+    if res.returncode != 0:
+        print("\n❌ GitHub CLI (gh) 未登录")
+        print("   请先在终端运行: gh auth login")
+        print("   选择 HTTPS → 浏览器授权即可\n")
+        sys.exit(1)
+    print("✅ GitHub CLI 已登录")
+
+
+def init_git(repo_url):
+    git_dir = REPO_ROOT / ".git"
+    if not git_dir.exists():
+        run_cmd("git init")
+        print("✅ 已初始化本地 git 仓库")
+
+    res = run_cmd("git remote get-url origin", check=False)
+    current_url = res.stdout.strip() if res.returncode == 0 else ""
+    if not current_url:
+        run_cmd(f"git remote add origin {repo_url}")
+        print(f"✅ 已关联远程仓库: {repo_url}")
+    elif current_url != repo_url:
+        run_cmd(f"git remote set-url origin {repo_url}")
+        print(f"✅ 远程仓库已更新: {current_url} -> {repo_url}")
+    else:
+        print(f"✅ 远程仓库已关联: {repo_url}")
+
+
+def prepare_files(cfg):
+    MODELS_DIR.mkdir(exist_ok=True)
+    CALIB_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    source_pt = cfg["source_pt"]
+    source_calib = cfg["source_calib"]
+
+    if not os.path.isfile(source_pt):
+        print(f"❌ 找不到模型文件: {source_pt}")
+        sys.exit(1)
+    dest_pt = MODELS_DIR / "input.pt"
+    shutil.copy2(source_pt, dest_pt)
+    print(f"✅ 已复制模型 -> {dest_pt}  ({dest_pt.stat().st_size / 1024 / 1024:.1f} MB)")
+
+    if not os.path.isdir(source_calib):
+        print(f"❌ 找不到校准图目录: {source_calib}")
+        sys.exit(1)
+
+    images = [p for p in Path(source_calib).iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp")]
+    if not images:
+        print("❌ 校准图目录里没有支持的图片格式")
+        sys.exit(1)
+
+    for old in CALIB_DIR.iterdir():
+        old.unlink()
+
+    for img in images:
+        shutil.copy2(img, CALIB_DIR / img.name)
+
+    print(f"✅ 已复制全部 {len(images)} 张校准图 -> {CALIB_DIR}")
+    return len(images)
+
+
+def sync_workflow_env(cfg, calib_count):
+    yml_path = REPO_ROOT / ".github" / "workflows" / "convert_k230.yml"
+    if not yml_path.exists():
+        print("⚠️ 未找到 workflow yml，跳过同步")
+        return
+
+    with open(yml_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    ishape = cfg["input_shape"]
+    env_block = (
+        "          K230_MODEL_PATH: models/input.pt\n"
+        f"          K230_KMODEL_PATH: results/{cfg['kmodel_filename']}\n"
+        "          K230_CALIB_DIR: calib/\n"
+        f'          K230_INPUT_SHAPE: "{ishape[0]},{ishape[1]},{ishape[2]},{ishape[3]}"\n'
+        f'          K230_ONNX_IMGSZ: "{cfg["onnx_imgsz"]}"\n'
+        f'          K230_ONNX_OPSET: "{cfg["onnx_opset"]}"\n'
+        f'          K230_ONNX_SIMPLIFY: "{str(cfg["onnx_simplify"]).lower()}"\n'
+        f'          K230_ONNX_NMS: "{str(cfg["onnx_nms"]).lower()}"\n'
+        f'          K230_QUANT_TYPE: "{cfg["quant_type"]}"\n'
+        f'          K230_W_QUANT_TYPE: "{cfg["w_quant_type"]}"\n'
+        f'          K230_CALIB_METHOD: "{cfg["calib_method"]}"\n'
+        f'          K230_MAX_CALIB_IMAGES: "{calib_count}"\n'
+        f'          K230_TARGET: "{cfg["target"]}"\n'
+    )
+
+    import re
+    pattern = r"          K230_MODEL_PATH:.*?\n(          K230_\w+:.*?\n)*"
+    new_content = re.sub(pattern, env_block, content, count=1)
+
+    if new_content != content:
+        with open(yml_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        print(f"✅ 已同步参数到 workflow yml ({ishape}, 校准图={calib_count}张)")
+
+
+def push_to_github(cfg):
+    sync_workflow_env(cfg, getattr(sys.modules[__name__], '_calib_count', 999))
+
+    run_cmd("git checkout -B convert-request")
+
+    # 只追踪转换必需的文件
+    run_cmd(f'git add -f "{MODELS_DIR}/" "{CALIB_DIR}/"')
+    run_cmd(f'git add -f "{REPO_ROOT / ".github" / "workflows" / "convert_k230.yml"}"')
+    run_cmd(f'git add -f "{REPO_ROOT / "convert_k230.py"}"')
+    run_cmd(f'git add -f "{REPO_ROOT / "easy_k230.py"}"')
+    run_cmd(f'git add -f "{REPO_ROOT / "README.md"}"')
+
+    # 确保 .gitignore 追踪
+    gitignore_path = REPO_ROOT / ".gitignore"
+    if gitignore_path.exists():
+        run_cmd(f'git add -f "{gitignore_path}"')
+
+    # 排除无关的 ultralytics workflow 文件
+    for wf in ["ci.yml", "cla.yml", "conda-check-prs.yml", "docker.yml", "docs.yml",
+               "format.yml", "links.yml", "merge-main-into-prs.yml", "mirror.yml",
+               "publish.yml", "stale.yml"]:
+        run_cmd(f'git reset HEAD -- ".github/workflows/{wf}"', check=False)
+    run_cmd("git reset HEAD -- .github/ISSUE_TEMPLATE/ .github/dependabot.yml", check=False)
+
+    run_cmd("git status", check=False)
+    res = run_cmd('git commit -m "Request K230 conversion"', check=False)
+    if res.returncode != 0:
+        print("⚠️ 没有新的变更需要提交，仍将推送以触发 Actions")
+    run_cmd("git push -u origin convert-request --force")
+    print("✅ 已推送到 GitHub（convert-request 分支）")
+
+
+def wait_and_download(cfg):
+    print("\n⏳ 等待 GitHub Actions 启动...")
+    time.sleep(10)
+
+    res = run_cmd('gh run list --branch convert-request --limit 1 --json databaseId,status,conclusion,name', check=False)
+    if res.returncode != 0 or not res.stdout.strip():
+        print("⚠️ 无法获取 Actions 运行列表")
+        return False
+
+    try:
+        runs = json.loads(res.stdout.strip())
+    except json.JSONDecodeError:
+        print("⚠️ 解析 Actions 列表失败")
+        return False
+
+    if not runs:
+        print("⚠️ 未找到运行记录")
+        return False
+
+    run_id = runs[0]["databaseId"]
+    print(f"🔍 运行 ID: {run_id}")
+    print("⏳ 等待转换完成（通常 3~8 分钟）...\n")
+
+    watch_res = run_cmd(f"gh run watch {run_id} --exit-status", check=False, capture=False)
+    if watch_res.returncode != 0:
+        print("\n❌ GitHub Actions 运行失败")
+        log_res = run_cmd(f"gh run view {run_id} --log-failed", check=False)
+        if log_res.returncode == 0 and log_res.stdout:
+            print("--- 失败日志 ---")
+            print(log_res.stdout[-3000:])
+        return False
+
+    print("\n✅ 转换成功！下载结果...")
+
+    for f in OUTPUT_DIR.iterdir():
+        if f.is_file():
+            f.unlink()
+        elif f.is_dir():
+            shutil.rmtree(f)
+
+    dl_res = run_cmd(f'gh run download {run_id} --name k230-model --dir "{OUTPUT_DIR}"', check=False)
+    if dl_res.returncode != 0:
+        dl_res = run_cmd(f'gh run download {run_id} --dir "{OUTPUT_DIR}"', check=False)
+        if dl_res.returncode != 0:
+            return False
+
+    kmodels = list(OUTPUT_DIR.rglob("*.kmodel"))
+    if kmodels:
+        script_dir = Path(__file__).parent.resolve()
+        print("\n" + "=" * 60)
+        print("🎉 转换成功！Kmodel 已下载到本地:")
+        for k in kmodels:
+            size_kb = k.stat().st_size / 1024
+            print(f"   📦 {k}  ({size_kb:.1f} KB)")
+            final = script_dir / k.name
+            shutil.copy2(k, final)
+            print(f"   📋 {final}")
+        print("=" * 60)
+    else:
+        print("⚠️ 未找到 .kmodel 文件")
+        return False
+    return True
+
+
+def main():
+    print("=" * 60)
+    print("  Yolo_to_K230 - YOLO 模型一键转 K230 Kmodel")
+    print("=" * 60)
+
+    # 命令行参数支持
+    args = sys.argv[1:]
+    if args:
+        cfg = load_config()
+        for arg in args:
+            if arg.startswith("--model="):
+                cfg["source_pt"] = arg.split("=", 1)[1].strip("'\"")
+            elif arg.startswith("--calib="):
+                cfg["source_calib"] = arg.split("=", 1)[1].strip("'\"")
+            elif arg.startswith("--repo="):
+                cfg["github_repo_url"] = arg.split("=", 1)[1].strip("'\"")
+        save_config(cfg)
+    else:
+        cfg = load_config()
+        needs_setup = not cfg.get("source_pt") or not cfg.get("source_calib") or not cfg.get("github_repo_url")
+        if needs_setup:
+            cfg = interactive_setup(cfg)
+
+    print(f"\n  模型:   {cfg['source_pt']}")
+    print(f"  校准图: {cfg['source_calib']}")
+    print(f"  尺寸:   {cfg['input_shape']}  (imgsz={cfg['onnx_imgsz']})")
+    print(f"  目标:   {cfg['target']}")
+    print(f"  量化:   {cfg['quant_type']}/{cfg['w_quant_type']} method={cfg['calib_method']}")
+    print(f"  输出:   {cfg['kmodel_filename']}")
+    print(f"  仓库:   {cfg['github_repo_url']}")
+    print()
+
+    setup_proxy(cfg.get("proxy_port", 0))
+    check_gh_login()
+    init_git(cfg["github_repo_url"])
+    calib_count = prepare_files(cfg)
+    sys.modules[__name__]._calib_count = calib_count
+    push_to_github(cfg)
+    success = wait_and_download(cfg)
+
+    if not success:
+        url = cfg.get("github_repo_url", "").rstrip(".git") + "/actions"
+        print(f"\n💡 请手动打开 GitHub Actions 页面查看:")
+        print(f"   {url}")
+
+    print("\n流程结束")
+
+
+if __name__ == "__main__":
+    main()
